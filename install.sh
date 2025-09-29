@@ -1,7 +1,7 @@
 #!/bin/bash
 
 export DEBIAN_FRONTEND=noninteractive
-APT_OPTS='-o Dpkg::Options::="--force-confold"'
+APT_OPTS='-o Dpkg::Options::="--force-confnew"'
 
 LOGFILE="/root/ptero_install.log"
 exec > >(tee -a $LOGFILE) 2>&1
@@ -19,6 +19,13 @@ retry_cmd() {
   done
   if [ $n -eq $max ]; then
     echo "Command failed after $max attempts, check logs."
+    # Tunjuk error apt jika ada
+    apt_errors=$(cat /root/ptero_install.log | grep -i 'error\|failed\|broken')
+    if [ ! -z "$apt_errors" ]; then
+      echo "APT errors detected:"
+      echo "$apt_errors"
+      echo "Try running: sudo apt --fix-broken install -y && sudo dpkg --configure -a && sudo apt update"
+    fi
     exit 1
   fi
 }
@@ -29,13 +36,16 @@ auto_fix() {
   if [[ $cmd == *apt* ]]; then
     sudo apt --fix-broken install -y || true
     sudo dpkg --configure -a || true
-    sudo apt update || true
+    sudo apt update --allow-releaseinfo-change || true
+    sudo apt upgrade -y $APT_OPTS || true
+    sudo apt autoremove -y || true
+    sudo apt clean || true
   fi
   if [[ $cmd == *mysql* ]]; then
     sudo systemctl restart mysql || true
   fi
   if [[ $cmd == *composer* ]]; then
-    sudo apt install -y composer || true
+    sudo apt install -y composer $APT_OPTS || true
   fi
   if [[ $cmd == *nginx* ]]; then
     sudo systemctl restart nginx || true
@@ -68,7 +78,8 @@ retry_cmd php artisan migrate --force || auto_fix "php artisan migrate --force"
 retry_cmd php artisan p:environment:setup --auto
 retry_cmd php artisan p:environment:database --auto
 retry_cmd php artisan p:environment:mail --auto
-retry_cmd php artisan p:user:make --auto
+# Buat user admin auto (email: admin@local, user: admin, password: ptero123)
+retry_cmd php artisan p:user:make --email=admin@local --username=admin --name="Admin" --password="ptero123" --admin=1 || retry_cmd php artisan p:user:make --auto
 retry_cmd sudo chown -R www-data:www-data /var/www/pterodactyl/*
 
 echo "==== [4] Install Wings Daemon ===="
@@ -121,7 +132,13 @@ sudo mkdir -p /var/lib/pterodactyl/eggs
 retry_cmd sudo wget -O /var/lib/pterodactyl/eggs/bot-wing.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/wing/egg-wing.json
 
 echo "==== [7] FINISHED ===="
+echo "============================================="
 echo "Pterodactyl Panel + Wings + Bot Wing Egg installed!"
-echo "Panel: http://$(hostname -I | awk '{print $1}')"
-echo "Daemon: Wings status: $(sudo systemctl status wings | grep Active)"
+echo "Panel Link: http://$(hostname -I | awk '{print $1}')"
+echo "Admin Login:"
+echo "  Username: admin"
+echo "  Email   : admin@local"
+echo "  Password: ptero123"
+echo "Daemon: Wings status: $(sudo systemctl is-active wings)"
 echo "Log: $LOGFILE"
+echo "============================================="
