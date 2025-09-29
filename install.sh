@@ -1,0 +1,127 @@
+#!/bin/bash
+
+export DEBIAN_FRONTEND=noninteractive
+APT_OPTS='-o Dpkg::Options::="--force-confold"'
+
+LOGFILE="/root/ptero_install.log"
+exec > >(tee -a $LOGFILE) 2>&1
+
+retry_cmd() {
+  local n=0
+  local max=3
+  local delay=5
+  until [ $n -ge $max ]; do
+    "$@" && break
+    n=$((n+1))
+    echo "Command failed. Attempt $n/$max. Retrying in $delay seconds..."
+    sleep $delay
+    auto_fix "$@"
+  done
+  if [ $n -eq $max ]; then
+    echo "Command failed after $max attempts, check logs."
+    exit 1
+  fi
+}
+
+auto_fix() {
+  local cmd="$*"
+  echo "Trying auto-fix for: $cmd"
+  if [[ $cmd == *apt* ]]; then
+    sudo apt --fix-broken install -y || true
+    sudo dpkg --configure -a || true
+    sudo apt update || true
+  fi
+  if [[ $cmd == *mysql* ]]; then
+    sudo systemctl restart mysql || true
+  fi
+  if [[ $cmd == *composer* ]]; then
+    sudo apt install -y composer || true
+  fi
+  if [[ $cmd == *nginx* ]]; then
+    sudo systemctl restart nginx || true
+  fi
+  # Add more auto-fix logic here if needed
+}
+
+echo "==== [1] Update & Install Dependencies ===="
+retry_cmd sudo apt update $APT_OPTS
+retry_cmd sudo apt upgrade -y $APT_OPTS
+retry_cmd sudo apt install -y curl wget git nginx mysql-server redis-server nodejs npm unzip tar composer $APT_OPTS
+
+echo "==== [2] Setup MariaDB/MySQL Database ===="
+retry_cmd sudo systemctl start mysql
+retry_cmd sudo mysql -e "CREATE DATABASE IF NOT EXISTS panel;"
+retry_cmd sudo mysql -e "CREATE USER IF NOT EXISTS 'ptero'@'localhost' IDENTIFIED BY 'pteropass';"
+retry_cmd sudo mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'ptero'@'localhost';"
+retry_cmd sudo mysql -e "FLUSH PRIVILEGES;"
+
+echo "==== [3] Install Pterodactyl Panel ===="
+retry_cmd sudo mkdir -p /var/www/pterodactyl
+retry_cmd sudo chown -R $(whoami):$(whoami) /var/www/pterodactyl
+retry_cmd git clone https://github.com/pterodactyl/panel.git /var/www/pterodactyl
+cd /var/www/pterodactyl
+retry_cmd git checkout $(git describe --tags $(git rev-list --tags --max-count=1))
+retry_cmd cp .env.example .env
+retry_cmd composer install --no-dev --optimize-autoloader
+retry_cmd php artisan key:generate --force
+retry_cmd php artisan migrate --force || auto_fix "php artisan migrate --force"
+retry_cmd php artisan p:environment:setup --auto
+retry_cmd php artisan p:environment:database --auto
+retry_cmd php artisan p:environment:mail --auto
+retry_cmd php artisan p:user:make --auto
+retry_cmd sudo chown -R www-data:www-data /var/www/pterodactyl/*
+
+echo "==== [4] Install Wings Daemon ===="
+retry_cmd sudo mkdir -p /srv/daemon
+retry_cmd sudo chown -R $(whoami):$(whoami) /srv/daemon
+retry_cmd curl -L https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64 -o /srv/daemon/wings
+retry_cmd chmod +x /srv/daemon/wings
+cat <<EOF | sudo tee /etc/systemd/system/wings.service
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/srv/daemon
+ExecStart=/srv/daemon/wings
+Restart=always
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
+EOF
+retry_cmd sudo systemctl daemon-reload
+retry_cmd sudo systemctl enable wings
+retry_cmd sudo systemctl start wings
+
+echo "==== [5] Setup Nginx ===="
+cat <<'NGINX' | sudo tee /etc/nginx/sites-available/pterodactyl
+server {
+    listen 80;
+    server_name _;
+    root /var/www/pterodactyl/public;
+    index index.php index.html;
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+    location ~ \.php$ {
+        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+}
+NGINX
+retry_cmd sudo ln -sf /etc/nginx/sites-available/pterodactyl /etc/nginx/sites-enabled/pterodactyl
+retry_cmd sudo systemctl reload nginx
+
+echo "==== [6] Download Egg for Bot Hosting (Wing) ===="
+sudo mkdir -p /var/lib/pterodactyl/eggs
+retry_cmd sudo wget -O /var/lib/pterodactyl/eggs/bot-wing.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/wing/egg-wing.json
+
+echo "==== [7] FINISHED ===="
+echo "Pterodactyl Panel + Wings + Bot Wing Egg installed!"
+echo "Panel: http://$(hostname -I | awk '{print $1}')"
+echo "Daemon: Wings status: $(sudo systemctl status wings | grep Active)"
+echo "Log: $LOGFILE"
