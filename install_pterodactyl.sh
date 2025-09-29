@@ -1,131 +1,124 @@
 #!/bin/bash
-# Pterodactyl Panel & Wings 100% Auto Installer + All Bot Hosting Eggs (NodeJS, Python, Discord, Telegram, etc)
-# By Earlbotay
 
-set -e
+LOGFILE="/root/ptero_install.log"
+exec > >(tee -a $LOGFILE) 2>&1
 
-if [ "$EUID" -ne 0 ]; then
-  echo "Run as root!"
-  exit 1
-fi
+retry_cmd() {
+  local n=0
+  local max=3
+  local delay=5
+  until [ $n -ge $max ]; do
+    "$@" && break
+    n=$((n+1))
+    echo "Command failed. Attempt $n/$max. Retrying in $delay seconds..."
+    sleep $delay
+    auto_fix "$@"
+  done
+  if [ $n -eq $max ]; then
+    echo "Command failed after $max attempts, check logs."
+    exit 1
+  fi
+}
 
-echo "Updating system..."
-apt update -y && apt upgrade -y
+auto_fix() {
+  local cmd="$*"
+  echo "Trying auto-fix for: $cmd"
+  if [[ $cmd == *apt* ]]; then
+    sudo apt --fix-broken install -y || true
+    sudo dpkg --configure -a || true
+    sudo apt update || true
+  fi
+  if [[ $cmd == *mysql* ]]; then
+    sudo systemctl restart mysql || true
+  fi
+  if [[ $cmd == *composer* ]]; then
+    sudo apt install -y composer || true
+  fi
+  if [[ $cmd == *nginx* ]]; then
+    sudo systemctl restart nginx || true
+  fi
+  # Add more auto-fix logic here if needed
+}
 
-echo "Installing dependencies..."
-apt install -y curl wget unzip tar git redis-server nginx mysql-server \
-  php php-fpm php-cli php-mysql php-zip php-gd php-mbstring php-xml php-curl \
-  php-redis php-async redis jq nodejs python3 python3-pip
+echo "==== [1] Update & Install Dependencies ===="
+retry_cmd sudo apt update
+retry_cmd sudo apt upgrade -y
+retry_cmd sudo apt install -y curl wget git nginx mysql-server redis-server nodejs npm unzip tar composer
 
-echo "Installing Node.js (latest)..."
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-apt install -y nodejs
+echo "==== [2] Setup MariaDB/MySQL Database ===="
+retry_cmd sudo systemctl start mysql
+retry_cmd sudo mysql -e "CREATE DATABASE IF NOT EXISTS panel;"
+retry_cmd sudo mysql -e "CREATE USER IF NOT EXISTS 'ptero'@'localhost' IDENTIFIED BY 'pteropass';"
+retry_cmd sudo mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'ptero'@'localhost';"
+retry_cmd sudo mysql -e "FLUSH PRIVILEGES;"
 
-echo "Installing Composer..."
-curl -sS https://getcomposer.org/installer | php
-mv composer.phar /usr/local/bin/composer
+echo "==== [3] Install Pterodactyl Panel ===="
+retry_cmd sudo mkdir -p /var/www/pterodactyl
+retry_cmd sudo chown -R $(whoami):$(whoami) /var/www/pterodactyl
+retry_cmd git clone https://github.com/pterodactyl/panel.git /var/www/pterodactyl
+cd /var/www/pterodactyl
+retry_cmd git checkout $(git describe --tags $(git rev-list --tags --max-count=1))
+retry_cmd cp .env.example .env
+retry_cmd composer install --no-dev --optimize-autoloader
+retry_cmd php artisan key:generate --force
+retry_cmd php artisan migrate --force || auto_fix "php artisan migrate --force"
+retry_cmd php artisan p:environment:setup --auto
+retry_cmd php artisan p:environment:database --auto
+retry_cmd php artisan p:environment:mail --auto
+retry_cmd php artisan p:user:make --auto
+retry_cmd sudo chown -R www-data:www-data /var/www/pterodactyl/*
 
-MYSQL_ROOT_PASSWORD="pteropass"
-echo "Configuring MySQL..."
-mysql -u root <<-EOF
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD';
-FLUSH PRIVILEGES;
+echo "==== [4] Install Wings Daemon ===="
+retry_cmd sudo mkdir -p /srv/daemon
+retry_cmd sudo chown -R $(whoami):$(whoami) /srv/daemon
+retry_cmd curl -L https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64 -o /srv/daemon/wings
+retry_cmd chmod +x /srv/daemon/wings
+cat <<EOF | sudo tee /etc/systemd/system/wings.service
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/srv/daemon
+ExecStart=/srv/daemon/wings
+Restart=always
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
 EOF
+retry_cmd sudo systemctl daemon-reload
+retry_cmd sudo systemctl enable wings
+retry_cmd sudo systemctl start wings
 
-mysql -u root -p"$MYSQL_ROOT_PASSWORD" <<-EOF
-CREATE DATABASE panel;
-CREATE USER 'ptero'@'localhost' IDENTIFIED BY 'panelpass';
-GRANT ALL PRIVILEGES ON panel.* TO 'ptero'@'localhost';
-FLUSH PRIVILEGES;
-EOF
-
-echo "Downloading Pterodactyl Panel..."
-cd /var/www/
-curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-tar -xzvf panel.tar.gz
-rm panel.tar.gz
-cd /var/www/panel
-
-composer install --no-dev --optimize-autoloader
-npm install --production
-
-chown -R www-data:www-data /var/www/panel
-chmod -R 755 /var/www/panel
-
-cp .env.example .env
-sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=panelpass/" .env
-
-php artisan key:generate
-php artisan migrate --seed --force
-
-cat > /etc/nginx/sites-available/pterodactyl <<EOL
+echo "==== [5] Setup Nginx ===="
+cat <<'NGINX' | sudo tee /etc/nginx/sites-available/pterodactyl
 server {
     listen 80;
     server_name _;
-    root /var/www/panel/public;
-    index index.php;
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
-    location ~ \.php\$ {
-        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+    root /var/www/pterodactyl/public;
+    index index.php index.html;
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+    location ~ \.php$ {
         fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
         fastcgi_index index.php;
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        fastcgi_param HTTP_PROXY "";
     }
-    location ~ /\.ht { deny all; }
 }
-EOL
-ln -s /etc/nginx/sites-available/pterodactyl /etc/nginx/sites-enabled/pterodactyl
-systemctl restart nginx
+NGINX
+retry_cmd sudo ln -sf /etc/nginx/sites-available/pterodactyl /etc/nginx/sites-enabled/pterodactyl
+retry_cmd sudo systemctl reload nginx
 
-echo "Downloading Wings..."
-mkdir -p /etc/pterodactyl
-curl -Lo /usr/local/bin/wings https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64
-chmod +x /usr/local/bin/wings
+echo "==== [6] Download Egg for Bot Hosting (Wing) ===="
+sudo mkdir -p /var/lib/pterodactyl/eggs
+retry_cmd sudo wget -O /var/lib/pterodactyl/eggs/bot-wing.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/wing/egg-wing.json
 
-cat > /etc/pterodactyl/config.yml <<EOL
-token: "changeme"
-api:
-  host: 0.0.0.0
-  port: 8080
-EOL
-
-cat > /etc/systemd/system/wings.service <<EOL
-[Unit]
-Description=Pterodactyl Wings Daemon
-After=docker.service
-Requires=docker.service
-[Service]
-User=root
-WorkingDirectory=/etc/pterodactyl
-LimitNOFILE=4096
-PIDFile=/var/run/wings.pid
-ExecStart=/usr/local/bin/wings
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOL
-
-systemctl daemon-reload
-systemctl enable --now wings
-
-# Download ALL Bot Hosting Eggs (NodeJS, Python, Discord, Telegram, WhatsApp, etc)
-mkdir -p /var/lib/pterodactyl-eggs
-# Eggs source: https://github.com/parkervcp/eggs
-curl -Lo /var/lib/pterodactyl-eggs/nodejs_bot.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/nodejs_bot.json
-curl -Lo /var/lib/pterodactyl-eggs/python_bot.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/python_bot.json
-curl -Lo /var/lib/pterodactyl-eggs/discordjs.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/discord/discordjs.json
-curl -Lo /var/lib/pterodactyl-eggs/discordpy.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/discord/discordpy.json
-curl -Lo /var/lib/pterodactyl-eggs/telegram_bot.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/telegram/telegram_bot.json
-curl -Lo /var/lib/pterodactyl-eggs/whatsapp_baileys.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/whatsapp/baileys.json
-curl -Lo /var/lib/pterodactyl-eggs/whatsapp_venom.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/whatsapp/venom.json
-curl -Lo /var/lib/pterodactyl-eggs/simplejs.json https://raw.githubusercontent.com/parkervcp/eggs/master/bots/simplejs.json
-
-echo "=== INSTALLATION COMPLETE ==="
+echo "==== [7] FINISHED ===="
+echo "Pterodactyl Panel + Wings + Bot Wing Egg installed!"
 echo "Panel: http://$(hostname -I | awk '{print $1}')"
-echo "MySQL root password: $MYSQL_ROOT_PASSWORD"
-echo "Panel DB: panel / User: ptero / Pass: panelpass"
-echo "Wings daemon running."
-echo "Eggs for JS, Python, Discord, Telegram, WhatsApp bot in /var/lib/pterodactyl-eggs"
+echo "Daemon: Wings status: $(sudo systemctl status wings | grep Active)"
+echo "Log: $LOGFILE"
